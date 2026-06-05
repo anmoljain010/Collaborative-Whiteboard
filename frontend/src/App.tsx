@@ -223,8 +223,8 @@ export default function App() {
     let reconnectTimeout: number;
 
     const connectWebSocket = () => {
-      // Points to backend WS server
-      const wsUrl = `ws://${window.location.hostname}:8000/ws/${user.id}`;
+      // Points to live backend WS server on Render
+      const wsUrl = `wss://codraw-backend-8okx.onrender.com/ws/${user.id}`;
       socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
