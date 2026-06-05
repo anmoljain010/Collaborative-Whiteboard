@@ -8,7 +8,7 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
   # React Frontend Static Site
-  - type: static
+  - type: web_site
     name: codraw-frontend
     env: static
     rootDir: frontend
