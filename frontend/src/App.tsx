@@ -14,7 +14,8 @@ import {
   User,
   X,
   Undo,
-  Redo
+  Redo,
+  Share2
 } from 'lucide-react';
 import type { Point, ToolType, BoardElement, CursorPosition, WebSocketMessage } from './types';
 
@@ -62,6 +63,14 @@ export default function App() {
   const [elements, setElements] = useState<Record<string, BoardElement>>({});
   const [cursors, setCursors] = useState<Record<string, CursorPosition>>({});
   
+  // Room state
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('room');
+  });
+  const [showShareModal, setShowShareModal] = useState<boolean>(false);
+  const [copied, setCopied] = useState<boolean>(false);
+
   // Interactive state
   const [activeTool, setActiveTool] = useState<ToolType>('pencil');
   const [selectedColor, setSelectedColor] = useState<string>('#3b82f6');
@@ -219,18 +228,28 @@ export default function App() {
 
   // Initialize and manage WebSocket connection
   useEffect(() => {
+    if (!activeRoomId) {
+      setWsConnected(false);
+      return;
+    }
+
     let socket: WebSocket;
     let reconnectTimeout: number;
 
     const connectWebSocket = () => {
-      // Points to live backend WS server on Render
-      const wsUrl = `wss://codraw-backend-8okx.onrender.com/ws/${user.id}`;
+      // Dynamically use local ws server if running on localhost, else fallback to live Render server
+      const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      const baseWsUrl = isLocalhost
+        ? `ws://${window.location.hostname}:8000`
+        : 'wss://codraw-backend-8okx.onrender.com';
+      
+      const wsUrl = `${baseWsUrl}/ws/${user.id}?room=${activeRoomId}`;
       socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
       socket.onopen = () => {
         setWsConnected(true);
-        console.log('Connected to whiteboard WebSocket server');
+        console.log('Connected to whiteboard WebSocket server for room:', activeRoomId);
       };
 
       socket.onclose = () => {
@@ -253,14 +272,17 @@ export default function App() {
               if (message.elements) {
                 const elementMap: Record<string, BoardElement> = {};
                 message.elements.forEach((el) => {
-                  elementMap[el.id] = el;
+                  // Only keep elements for this active room (dual-layer isolation fallback)
+                  if (el.id.startsWith(activeRoomId + '_')) {
+                    elementMap[el.id] = el;
+                  }
                 });
                 setElements(elementMap);
               }
               break;
             case 'element_add':
             case 'element_update':
-              if (message.element) {
+              if (message.element && message.element.id.startsWith(activeRoomId + '_')) {
                 setElements((prev) => ({
                   ...prev,
                   [message.element!.id]: message.element!
@@ -268,7 +290,7 @@ export default function App() {
               }
               break;
             case 'element_delete':
-              if (message.elementId) {
+              if (message.elementId && message.elementId.startsWith(activeRoomId + '_')) {
                 setElements((prev) => {
                   const updated = { ...prev };
                   delete updated[message.elementId!];
@@ -280,11 +302,13 @@ export default function App() {
               }
               break;
             case 'cursor_move':
-              if (message.cursor) {
+              if (message.cursor && message.cursor.userId.startsWith(activeRoomId + '_')) {
+                const cleanUserId = message.cursor.userId.substring(activeRoomId.length + 1);
                 setCursors((prev) => ({
                   ...prev,
-                  [message.cursor!.userId]: {
+                  [cleanUserId]: {
                     ...message.cursor!,
+                    userId: cleanUserId,
                     lastUpdated: Date.now()
                   }
                 }));
@@ -325,7 +349,7 @@ export default function App() {
       clearTimeout(reconnectTimeout);
       clearInterval(cursorCleanupInterval);
     };
-  }, [user.id]);
+  }, [user.id, activeRoomId]);
 
   // Update userName locally and globally
   const handleSaveSettings = () => {
@@ -342,14 +366,39 @@ export default function App() {
     localStorage.setItem('board_user_color', newColor);
   };
 
+  const handleCreateRoom = () => {
+    const roomId = Math.random().toString(36).substring(2, 9);
+    setActiveRoomId(roomId);
+    window.history.pushState(null, '', `?room=${roomId}`);
+  };
 
+  const handleJoinRoom = (roomId: string) => {
+    if (!roomId.trim()) return;
+    const cleanRoomId = roomId.trim();
+    setActiveRoomId(cleanRoomId);
+    window.history.pushState(null, '', `?room=${cleanRoomId}`);
+  };
 
-  // Clear Board action
+  const handleLeaveRoom = () => {
+    setActiveRoomId(null);
+    window.history.pushState(null, '', window.location.pathname);
+    setElements({});
+    setSelectedElementId(null);
+    setShowSettings(false);
+  };
+
+  // Clear Board action (room isolated)
   const handleClearBoard = () => {
-    if (window.confirm('Are you sure you want to clear the whiteboard for all users?')) {
+    if (!activeRoomId) return;
+    if (window.confirm('Are you sure you want to clear the whiteboard for this room?')) {
+      // Send individual delete events for each element in this room
+      Object.keys(elements).forEach((id) => {
+        if (id.startsWith(activeRoomId + '_')) {
+          sendWSMessage({ type: 'element_delete', elementId: id });
+        }
+      });
       setElements({});
       setSelectedElementId(null);
-      sendWSMessage({ type: 'clear' });
     }
   };
 
@@ -574,18 +623,14 @@ export default function App() {
       window.removeEventListener('resize', resizeCanvas);
       cancelAnimationFrame(animationFrameId);
     };
-  }, [elements, panOffset, zoom, selectedElementId]);
+  }, [elements, panOffset, zoom, selectedElementId, canvasBgColor]);
 
-  // Mouse Handlers
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    // Only left click triggers drawing/panning
-    if (e.button !== 0) return;
+  // Shared Interaction Helpers
+  const onStart = (clientX: number, clientY: number, shiftKey: boolean) => {
+    const screenPos = { x: clientX, y: clientY };
+    const canvasPos = getCanvasCoordinates(clientX, clientY);
 
-    const screenPos = { x: e.clientX, y: e.clientY };
-    const canvasPos = getCanvasCoordinates(e.clientX, e.clientY);
-
-    // Space held or eraser tool/select tool empty pan triggers panning
-    if (activeTool === 'select' && e.shiftKey) {
+    if (activeTool === 'select' && shiftKey) {
       setIsPanning(true);
       setPanStart(screenPos);
       return;
@@ -623,9 +668,8 @@ export default function App() {
       return;
     }
 
-    // Creating shapes/drawing
     setIsDrawing(true);
-    const id = generateId();
+    const id = activeRoomId ? `${activeRoomId}_${generateId()}` : generateId();
     setActiveElementId(id);
 
     let newElement: BoardElement;
@@ -685,7 +729,7 @@ export default function App() {
       newElement = {
         id,
         type: 'sticky',
-        x: canvasPos.x - 90, // Center note on click
+        x: canvasPos.x - 90,
         y: canvasPos.y - 90,
         width: 180,
         height: 180,
@@ -732,17 +776,17 @@ export default function App() {
     sendWSMessage({ type: 'element_add', element: newElement });
   };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const screenPos = { x: e.clientX, y: e.clientY };
-    const canvasPos = getCanvasCoordinates(e.clientX, e.clientY);
+  const onMove = (clientX: number, clientY: number) => {
+    const screenPos = { x: clientX, y: clientY };
+    const canvasPos = getCanvasCoordinates(clientX, clientY);
 
-    // Broadcast cursor position (Throttled to 35ms to conserve websocket packets)
+    // Broadcast cursor position (Throttled to 35ms)
     const now = Date.now();
-    if (now - lastCursorBroadcast.current > 35) {
+    if (now - lastCursorBroadcast.current > 35 && activeRoomId) {
       sendWSMessage({
         type: 'cursor_move',
         cursor: {
-          userId: user.id,
+          userId: `${activeRoomId}_${user.id}`,
           userName: user.name,
           color: user.color,
           x: canvasPos.x,
@@ -795,7 +839,6 @@ export default function App() {
         height: canvasPos.y - activeEl.y
       };
     } else if (activeEl.type === 'circle') {
-      // Calculate radius as distance from start to current mouse pos
       const dx = canvasPos.x - activeEl.x;
       const dy = canvasPos.y - activeEl.y;
       const radius = Math.hypot(dx, dy);
@@ -812,7 +855,7 @@ export default function App() {
     sendWSMessage({ type: 'element_update', element: updated });
   };
 
-  const handleMouseUp = () => {
+  const onEnd = () => {
     if (isDrawing && activeElementId && elements[activeElementId]) {
       pushToUndoStack({ type: 'add', element: elements[activeElementId] });
     }
@@ -828,6 +871,37 @@ export default function App() {
     setIsPanning(false);
     setIsDraggingElement(false);
     draggedElementInitialState.current = null;
+  };
+
+  // Mouse Handlers
+  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (e.button !== 0) return;
+    onStart(e.clientX, e.clientY, e.shiftKey);
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    onMove(e.clientX, e.clientY);
+  };
+
+  const handleMouseUp = () => {
+    onEnd();
+  };
+
+  // Touch Handlers
+  const handleTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length === 0) return;
+    const touch = e.touches[0];
+    onStart(touch.clientX, touch.clientY, false);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length === 0) return;
+    const touch = e.touches[0];
+    onMove(touch.clientX, touch.clientY);
+  };
+
+  const handleTouchEnd = () => {
+    onEnd();
   };
 
   // HTML Overlay Text area change handler
@@ -852,6 +926,81 @@ export default function App() {
     if (selectedElementId === id) setSelectedElementId(null);
   };
 
+  // Render Room Lobby Landing Page if room is null
+  if (!activeRoomId) {
+    return (
+      <div className="min-h-screen w-screen flex flex-col items-center justify-center bg-slate-950 text-slate-100 p-4 relative overflow-hidden font-sans select-none">
+        {/* Modern ambient glowing backgrounds */}
+        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-violet-600/20 rounded-full blur-[120px] pointer-events-none animate-pulse duration-4000" />
+        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-fuchsia-600/20 rounded-full blur-[120px] pointer-events-none animate-pulse duration-4000 delay-1000" />
+
+        <div className="relative z-10 max-w-md w-full flex flex-col items-center gap-8 text-center animate-fade-in">
+          {/* Glowing logo / header */}
+          <div className="flex flex-col items-center gap-3">
+            <div className="p-4 bg-gradient-to-tr from-violet-600 to-fuchsia-600 rounded-3xl shadow-xl shadow-violet-600/20">
+              <Pencil size={36} className="text-white" />
+            </div>
+            <h1 className="text-5xl font-black tracking-tight bg-gradient-to-r from-violet-400 via-fuchsia-400 to-pink-400 bg-clip-text text-transparent drop-shadow-sm mt-4">
+              CoDraw
+            </h1>
+            <p className="text-sm md:text-base text-slate-400 font-medium max-w-sm mt-2">
+              A premium, real-time collaborative whiteboard. Sketch, add sticky notes, and share with your team instantly.
+            </p>
+          </div>
+
+          {/* Actions Card */}
+          <div className="w-full bg-slate-900/60 border border-slate-800/85 backdrop-blur-md p-6 md:p-8 rounded-3xl shadow-2xl flex flex-col gap-6">
+            {/* Create Room Button */}
+            <button
+              onClick={handleCreateRoom}
+              className="w-full py-4 px-6 rounded-2xl bg-gradient-to-r from-violet-600 to-fuchsia-600 hover:from-violet-500 hover:to-fuchsia-500 text-white font-bold text-base transition-all duration-200 cursor-pointer shadow-lg shadow-violet-600/20 hover:scale-[1.02] active:scale-[0.98]"
+            >
+              Create New Board
+            </button>
+
+            {/* Or Divider */}
+            <div className="flex items-center gap-3 text-slate-600 text-xs font-bold uppercase tracking-wider">
+              <div className="h-px flex-1 bg-slate-800" />
+              <span>Or Join Existing</span>
+              <div className="h-px flex-1 bg-slate-800" />
+            </div>
+
+            {/* Join Room Form */}
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const target = e.currentTarget.elements.namedItem('roomIdInput') as HTMLInputElement;
+                handleJoinRoom(target.value);
+              }}
+              className="flex flex-col gap-3"
+            >
+              <div className="relative">
+                <input
+                  name="roomIdInput"
+                  type="text"
+                  required
+                  placeholder="Enter Board Room ID..."
+                  className="w-full px-4 py-3 bg-slate-950/80 border border-slate-800 rounded-2xl focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent text-slate-100 placeholder-slate-500 text-sm font-semibold transition-all"
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full py-3.5 px-6 rounded-2xl bg-slate-850 hover:bg-slate-800 text-slate-200 font-semibold text-sm transition-all duration-200 cursor-pointer hover:scale-[1.01] active:scale-[0.99]"
+              >
+                Join Board
+              </button>
+            </form>
+          </div>
+
+          {/* Footer credits */}
+          <span className="text-[10px] text-slate-600 font-bold uppercase tracking-widest mt-4">
+            Built with React & FastAPI
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       ref={containerRef}
@@ -865,6 +1014,9 @@ export default function App() {
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
         className="absolute inset-0 block cursor-crosshair touch-none"
       />
 
@@ -899,7 +1051,7 @@ export default function App() {
                   {/* Drag Handle & Delete */}
                   <div className="flex justify-between items-center mb-1 text-xs opacity-40 hover:opacity-100 transition-opacity">
                     <div 
-                      className="cursor-move p-0.5" 
+                      className="cursor-move p-0.5 select-none" 
                       title="Drag Note"
                       onMouseDown={(e) => {
                         e.stopPropagation();
@@ -907,6 +1059,19 @@ export default function App() {
                         setIsDraggingElement(true);
                         draggedElementInitialState.current = el;
                         const canvasPos = getCanvasCoordinates(e.clientX, e.clientY);
+                        setDragStartOffset({
+                          x: canvasPos.x - el.x,
+                          y: canvasPos.y - el.y
+                        });
+                      }}
+                      onTouchStart={(e) => {
+                        e.stopPropagation();
+                        if (e.touches.length === 0) return;
+                        const touch = e.touches[0];
+                        setSelectedElementId(el.id);
+                        setIsDraggingElement(true);
+                        draggedElementInitialState.current = el;
+                        const canvasPos = getCanvasCoordinates(touch.clientX, touch.clientY);
                         setDragStartOffset({
                           x: canvasPos.x - el.x,
                           y: canvasPos.y - el.y
@@ -1063,7 +1228,7 @@ export default function App() {
           <div className="flex items-center gap-1">
             <button
               onClick={handleZoomOut}
-              className="p-1 rounded-lg hover:bg-slate-800 text-slate-300 transition-colors"
+              className="p-1 rounded-lg hover:bg-slate-800 text-slate-300 transition-colors cursor-pointer"
               title="Zoom Out"
             >
               <ZoomOut size={16} />
@@ -1077,7 +1242,7 @@ export default function App() {
             </span>
             <button
               onClick={handleZoomIn}
-              className="p-1 rounded-lg hover:bg-slate-800 text-slate-300 transition-colors"
+              className="p-1 rounded-lg hover:bg-slate-800 text-slate-300 transition-colors cursor-pointer"
               title="Zoom In"
             >
               <ZoomIn size={16} />
@@ -1111,70 +1276,83 @@ export default function App() {
       {/* Floating Glassmorphic Main Toolbar (Top Center) */}
       <div className="absolute top-6 left-1/2 -translate-x-1/2 pointer-events-auto z-40">
         <div className="flex flex-col gap-3 items-center">
-          {/* Main Actions Panel */}
-          <div className="flex items-center gap-1.5 bg-slate-900/80 backdrop-blur-md p-2 rounded-2xl border border-slate-800 shadow-2xl">
-            {[
-              { id: 'select', icon: <Pointer size={18} />, label: 'Select / Move (Shift+Drag to Pan)' },
-              { id: 'pencil', icon: <Pencil size={18} />, label: 'Draw' },
-              { id: 'line', icon: <Minus size={18} />, label: 'Line' },
-              { id: 'rectangle', icon: <Square size={18} />, label: 'Rectangle' },
-              { id: 'circle', icon: <CircleIcon size={18} />, label: 'Circle' },
-              { id: 'sticky', icon: <FileText size={18} />, label: 'Sticky Note' },
-              { id: 'text', icon: <Type size={18} />, label: 'Text Box' },
-              { id: 'eraser', icon: <Eraser size={18} />, label: 'Eraser' }
-            ].map((tool) => (
+          {/* Main Actions Panel & Share Wrapper */}
+          <div className="flex items-center gap-2 flex-wrap justify-center">
+            {/* Main Actions Panel */}
+            <div className="flex items-center gap-1.5 bg-slate-900/80 backdrop-blur-md p-2 rounded-2xl border border-slate-800 shadow-2xl flex-wrap justify-center max-w-[95vw] md:max-w-none">
+              {[
+                { id: 'select', icon: <Pointer size={18} />, label: 'Select / Move (Shift+Drag to Pan)' },
+                { id: 'pencil', icon: <Pencil size={18} />, label: 'Draw' },
+                { id: 'line', icon: <Minus size={18} />, label: 'Line' },
+                { id: 'rectangle', icon: <Square size={18} />, label: 'Rectangle' },
+                { id: 'circle', icon: <CircleIcon size={18} />, label: 'Circle' },
+                { id: 'sticky', icon: <FileText size={18} />, label: 'Sticky Note' },
+                { id: 'text', icon: <Type size={18} />, label: 'Text Box' },
+                { id: 'eraser', icon: <Eraser size={18} />, label: 'Eraser' }
+              ].map((tool) => (
+                <button
+                  key={tool.id}
+                  onClick={() => {
+                    setActiveTool(tool.id as ToolType);
+                    if (tool.id !== 'select') setSelectedElementId(null);
+                  }}
+                  className={`p-2.5 rounded-xl transition-all duration-200 cursor-pointer ${
+                    activeTool === tool.id
+                      ? 'bg-violet-600 text-white shadow-lg shadow-violet-600/30'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                  }`}
+                  title={tool.label}
+                >
+                  {tool.icon}
+                </button>
+              ))}
+
+              <div className="h-6 w-px bg-slate-800 mx-1" />
+
+              {/* Undo button */}
               <button
-                key={tool.id}
-                onClick={() => {
-                  setActiveTool(tool.id as ToolType);
-                  if (tool.id !== 'select') setSelectedElementId(null);
-                }}
-                className={`p-2.5 rounded-xl transition-all duration-200 cursor-pointer ${
-                  activeTool === tool.id
-                    ? 'bg-violet-600 text-white shadow-lg shadow-violet-600/30'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
-                }`}
-                title={tool.label}
+                onClick={handleUndo}
+                className="p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors cursor-pointer"
+                title="Undo (Ctrl+Z)"
               >
-                {tool.icon}
+                <Undo size={18} />
               </button>
-            ))}
 
-            <div className="h-6 w-px bg-slate-800 mx-1" />
+              {/* Redo button */}
+              <button
+                onClick={handleRedo}
+                className="p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors cursor-pointer"
+                title="Redo (Ctrl+Y)"
+              >
+                <Redo size={18} />
+              </button>
 
-            {/* Undo button */}
+              <div className="h-6 w-px bg-slate-800 mx-1" />
+
+              {/* Clear button */}
+              <button
+                onClick={handleClearBoard}
+                className="p-2.5 rounded-xl text-slate-400 hover:text-rose-400 hover:bg-slate-800/60 transition-colors cursor-pointer"
+                title="Clear Whiteboard"
+              >
+                <Trash2 size={18} />
+              </button>
+            </div>
+
+            {/* Share Room Button */}
             <button
-              onClick={handleUndo}
-              className="p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors cursor-pointer"
-              title="Undo (Ctrl+Z)"
+              onClick={() => setShowShareModal(true)}
+              className="p-2.5 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold transition-all duration-200 cursor-pointer shadow-lg shadow-indigo-600/30 flex items-center gap-2 text-xs md:text-sm px-4"
+              title="Share Board Room"
             >
-              <Undo size={18} />
-            </button>
-
-            {/* Redo button */}
-            <button
-              onClick={handleRedo}
-              className="p-2.5 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-800/60 transition-colors cursor-pointer"
-              title="Redo (Ctrl+Y)"
-            >
-              <Redo size={18} />
-            </button>
-
-            <div className="h-6 w-px bg-slate-800 mx-1" />
-
-            {/* Clear button */}
-            <button
-              onClick={handleClearBoard}
-              className="p-2.5 rounded-xl text-slate-400 hover:text-rose-400 hover:bg-slate-800/60 transition-colors cursor-pointer"
-              title="Clear Whiteboard"
-            >
-              <Trash2 size={18} />
+              <Share2 size={18} />
+              <span className="hidden md:inline">Share</span>
             </button>
           </div>
 
           {/* Context Options for Select Tool (Arrange Layers & Delete) */}
           {activeTool === 'select' && selectedElementId && elements[selectedElementId] && (
-            <div className="flex items-center gap-4 bg-slate-900/80 backdrop-blur-md px-4 py-2 rounded-xl border border-slate-800 shadow-xl text-xs">
+            <div className="flex flex-wrap items-center justify-center gap-2 bg-slate-900/80 backdrop-blur-md px-4 py-2 rounded-xl border border-slate-800 shadow-xl text-xs max-w-[90vw]">
               <span className="text-slate-400 font-semibold">Arrange:</span>
               <button
                 onClick={bringToFront}
@@ -1203,7 +1381,7 @@ export default function App() {
 
           {/* Context Options (Colors & Stroke sizing) */}
           {activeTool !== 'select' && activeTool !== 'eraser' && (
-            <div className="flex items-center gap-4 bg-slate-900/80 backdrop-blur-md px-4 py-2 rounded-xl border border-slate-800 shadow-xl text-xs">
+            <div className="flex flex-wrap items-center justify-center gap-3 bg-slate-900/80 backdrop-blur-md px-4 py-2 rounded-xl border border-slate-800 shadow-xl text-xs max-w-[90vw]">
               {activeTool === 'sticky' ? (
                 // Sticky Note Color Picker
                 <div className="flex items-center gap-2">
@@ -1225,7 +1403,7 @@ export default function App() {
                 // Stroke Color Picker
                 <div className="flex items-center gap-2">
                   <span className="text-slate-400 font-semibold">Color:</span>
-                  <div className="flex gap-1.5">
+                  <div className="flex gap-1.5 flex-wrap">
                     {COLORS.map((col) => (
                       <button
                         key={col.value}
@@ -1284,7 +1462,7 @@ export default function App() {
           <div className="absolute right-0 mt-3 w-64 bg-slate-900/95 backdrop-blur-lg border border-slate-800 p-4 rounded-2xl shadow-2xl flex flex-col gap-4 text-sm z-50">
             <div className="flex justify-between items-center pb-2 border-b border-slate-800">
               <span className="font-bold text-slate-200">Collaborator Profile</span>
-              <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-white">
+              <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-white cursor-pointer">
                 <X size={16} />
               </button>
             </div>
@@ -1297,7 +1475,7 @@ export default function App() {
                 onChange={(e) => setTempName(e.target.value)}
                 placeholder="Enter name..."
                 maxLength={18}
-                className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-xl focus:outline-none focus:ring-1 focus:ring-violet-500 text-slate-100"
+                className="w-full px-3 py-1.5 bg-slate-950 border border-slate-800 rounded-xl focus:outline-none focus:ring-1 focus:ring-violet-500 text-slate-100 font-semibold"
               />
             </div>
 
@@ -1309,7 +1487,7 @@ export default function App() {
                     key={col.value}
                     onClick={() => handleColorChange(col.value)}
                     style={{ backgroundColor: col.value }}
-                    className={`w-6 h-6 rounded-full border transition-transform ${
+                    className={`w-6 h-6 rounded-full border transition-transform cursor-pointer ${
                       user.color === col.value ? 'scale-110 ring-2 ring-violet-500 border-white' : 'border-transparent'
                     }`}
                   />
@@ -1323,12 +1501,18 @@ export default function App() {
             >
               Save Changes
             </button>
+            <button
+              onClick={handleLeaveRoom}
+              className="w-full bg-rose-950/40 hover:bg-rose-900/40 text-rose-300 font-bold py-2 rounded-xl transition-colors cursor-pointer border border-rose-900/50 mt-1"
+            >
+              Leave Room
+            </button>
           </div>
         )}
       </div>
 
       {/* Floating Overlay Helper Info */}
-      <div className="absolute bottom-6 right-6 hidden md:block z-30 opacity-45 hover:opacity-100 transition-opacity">
+      <div className="absolute bottom-6 right-6 hidden md:block z-35 opacity-45 hover:opacity-100 transition-opacity">
         <div className="bg-slate-900/40 backdrop-blur-sm border border-slate-900 p-3 rounded-xl text-[10px] text-slate-500 font-medium">
           <ul className="list-disc list-inside space-y-0.5">
             <li>Shift + Drag: Pan Canvas</li>
@@ -1338,6 +1522,78 @@ export default function App() {
           </ul>
         </div>
       </div>
+
+      {/* Share Board QR Code Modal */}
+      {showShareModal && (
+        <div
+          className="fixed inset-0 bg-slate-950/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 cursor-default"
+          onClick={() => setShowShareModal(false)}
+        >
+          <div
+            className="bg-slate-900/95 border border-slate-800 rounded-3xl p-6 max-w-sm w-full shadow-2xl flex flex-col items-center gap-5 text-center relative pointer-events-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Close button */}
+            <button
+              onClick={() => setShowShareModal(false)}
+              className="absolute top-4 right-4 p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-850 transition-colors cursor-pointer"
+            >
+              <X size={16} />
+            </button>
+
+            {/* Header */}
+            <div className="flex flex-col items-center gap-1.5 mt-2">
+              <h3 className="text-lg font-bold text-slate-200">Share Board Room</h3>
+              <p className="text-xs text-slate-400 font-medium max-w-[240px]">
+                Scan this QR code with a phone camera or copy the link to collaborate in real-time.
+              </p>
+            </div>
+
+            {/* QR Code Container */}
+            <div className="p-4 bg-white rounded-2xl shadow-inner border border-slate-800">
+              <img
+                src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(
+                  `${window.location.origin}${window.location.pathname}?room=${activeRoomId}`
+                )}`}
+                alt="Room QR Code"
+                className="w-44 h-44 block"
+              />
+            </div>
+
+            {/* Copy Link Input */}
+            <div className="w-full flex flex-col gap-2 mt-2">
+              <div className="flex items-center gap-2 bg-slate-950 border border-slate-800 p-1.5 rounded-2xl w-full">
+                <input
+                  type="text"
+                  readOnly
+                  value={`${window.location.origin}${window.location.pathname}?room=${activeRoomId}`}
+                  className="flex-1 bg-transparent border-none outline-none text-[11px] text-slate-400 font-mono pl-2 truncate"
+                />
+                <button
+                  onClick={() => {
+                    const shareUrl = `${window.location.origin}${window.location.pathname}?room=${activeRoomId}`;
+                    navigator.clipboard.writeText(shareUrl);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 2000);
+                  }}
+                  className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+                    copied
+                      ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20'
+                      : 'bg-violet-600 hover:bg-violet-700 text-white shadow-lg shadow-violet-600/20'
+                  }`}
+                >
+                  {copied ? 'Copied!' : 'Copy'}
+                </button>
+              </div>
+            </div>
+
+            {/* Footer Info */}
+            <div className="text-[10px] text-slate-500 font-bold tracking-widest uppercase">
+              Room ID: <span className="font-mono text-slate-400">{activeRoomId}</span>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
