@@ -1,5 +1,4 @@
 services:
-  # FastAPI Backend Web Service
   - type: web
     name: codraw-backend
     env: python
@@ -7,9 +6,8 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
-  # React Frontend Static Site
-  - type: static
-    name: codraw-frontend
+statics:
+  - name: codraw-frontend
     env: static
     rootDir: frontend
     buildCommand: npm install && npm run build
